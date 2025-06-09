@@ -12,7 +12,6 @@ import sys
 from datetime import datetime
 
 from services.pdf_parser import extract_invoice_data
-from services.goose_integration import goose_client
 from models.invoice import InvoiceData
 
 # Configure logging
@@ -98,6 +97,10 @@ class GooseResponse(BaseModel):
     shell_command: Optional[str] = None
     shell_response: Optional[str] = None
     task_response: Optional[Dict[str, Any]] = None
+
+class ParseInvoiceRequest(BaseModel):
+    """Request model for invoice parsing with instructions."""
+    instructions: str = "Analyze this invoice and extract all relevant information."
 
 def extract_shell_command(text: str) -> dict:
     """Extract shell command and its output from the response."""
@@ -277,12 +280,19 @@ def run_goose(input: GooseInput):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/parse-invoice/", response_model=InvoiceData)
-async def parse_invoice(file: UploadFile = File(...)):
+async def parse_invoice(
+    file: UploadFile = File(...),
+    request: ParseInvoiceRequest = None
+):
     """
     Parse an invoice PDF and return structured data.
     
     This endpoint accepts a PDF file upload and extracts key invoice details
     including invoice number, dates, amounts, and parties involved.
+    
+    Args:
+        file: The PDF file to parse
+        request: Optional request body containing instructions for the goose agent
     """
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -291,11 +301,13 @@ async def parse_invoice(file: UploadFile = File(...)):
         contents = await file.read()
         invoice_data = extract_invoice_data(contents)
         
-        # Goose API integration test
-        response = await goose_client.run_goose_agent(
-            instructions="say hello",
-            session_name="test-session"
+        # Direct goose integration test
+        goose_input = GooseInput(
+            instructions=request.instructions if request else "Analyze this invoice data and provide insights",
+            session_name="test-session",
+            data={"invoice_data": invoice_data.dict()}
         )
+        response = run_goose(goose_input)
         print(response)
         
         return invoice_data
