@@ -1,6 +1,8 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from typing import Dict, Any, Optional, List
 import subprocess
 import re
 import os
@@ -8,7 +10,10 @@ import json
 import logging
 import sys
 from datetime import datetime
-from typing import Dict, Any, Optional, List
+
+from services.pdf_parser import extract_invoice_data
+from services.goose_integration import goose_client
+from models.invoice import InvoiceData
 
 # Configure logging
 logging.basicConfig(
@@ -20,105 +25,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("goose-api")
 
-def extract_shell_command(text: str) -> dict:
-    """Extract shell command and its output from the response."""
-    command_pattern = r'command: (.*?)(?:\n\n|\n$)'
-    command_match = re.search(command_pattern, text, re.DOTALL)
-    
-    if command_match:
-        command = command_match.group(1).strip()
-        # Get everything after the command as the response
-        response_text = text[text.find(command) + len(command):].strip()
-        return {
-            "command": command,
-            "response": response_text
-        }
-    return None
+# Initialize FastAPI app
+app = FastAPI(
+    title="Next Invoice Parser API",
+    description="API for extracting structured data from invoice PDFs"
+)
 
-def clean_goose_output(output: str) -> str:
-    if not output:
-        logger.warning("Received empty output from goose command")
-        return ""
-        
-    logger.debug(f"Raw goose output: {output}")
-    # Remove ANSI color codes
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    clean_output = ansi_escape.sub('', output)
-
-    # Remove lines about logging and directories
-    filtered_lines = []
-    for line in clean_output.splitlines():
-        if not any(kw in line.lower() for kw in ["logging to", "working directory", "starting session"]):
-            filtered_lines.append(line.strip())
-
-    cleaned = "\n".join(filtered_lines).strip()
-    logger.debug(f"Cleaned output: {cleaned}")
-    return cleaned
-
-
-def parse_goose_response(response: str, task: Optional[str] = None) -> dict:
-    if not response:
-        logger.warning("Received empty response to parse")
-        return {
-            "raw_response": "",
-            "parsed_actions": [],
-            "error": "Empty response received from goose command"
-        }
-        
-    logger.debug(f"Parsing response: {response}")
-    
-    # First try to parse as a shell command response
-    shell_info = extract_shell_command(response)
-    if shell_info:
-        return {
-            "raw_response": response,
-            "parsed_actions": [{
-                "action": "shell_command",
-                "parameters": shell_info
-            }],
-            "shell_command": shell_info["command"],
-            "shell_response": shell_info["response"]
-        }
-    
-    # Look for function calls in the response
-    function_pattern = r'<function=([^{]+){([^}]+)}</function>'
-    matches = re.finditer(function_pattern, response)
-    
-    parsed_actions = []
-    for match in matches:
-        function_name = match.group(1)
-        try:
-            params = json.loads(match.group(2))
-            parsed_actions.append({
-                "action": function_name,
-                "parameters": params
-            })
-            logger.debug(f"Parsed action: {function_name} with params: {params}")
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON for function {function_name}: {e}")
-            parsed_actions.append({
-                "action": function_name,
-                "parameters": match.group(2)
-            })
-    
-    result = {
-        "raw_response": response,
-        "parsed_actions": parsed_actions
-    }
-    
-    if not parsed_actions:
-        logger.warning("No actions were parsed from the response")
-        result["error"] = "No actions found in response"
-        
-    logger.debug(f"Final parsed result: {json.dumps(result)}")
-    return result
-
-
-app = FastAPI()
-
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # In production, restrict to specific origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -182,6 +98,93 @@ class GooseResponse(BaseModel):
     shell_command: Optional[str] = None
     shell_response: Optional[str] = None
     task_response: Optional[Dict[str, Any]] = None
+
+def extract_shell_command(text: str) -> dict:
+    """Extract shell command and its output from the response."""
+    command_pattern = r'command: (.*?)(?:\n\n|\n$)'
+    command_match = re.search(command_pattern, text, re.DOTALL)
+    
+    if command_match:
+        command = command_match.group(1).strip()
+        response_text = text[text.find(command) + len(command):].strip()
+        return {
+            "command": command,
+            "response": response_text
+        }
+    return None
+
+def clean_goose_output(output: str) -> str:
+    if not output:
+        logger.warning("Received empty output from goose command")
+        return ""
+        
+    logger.debug(f"Raw goose output: {output}")
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    clean_output = ansi_escape.sub('', output)
+
+    filtered_lines = []
+    for line in clean_output.splitlines():
+        if not any(kw in line.lower() for kw in ["logging to", "working directory", "starting session"]):
+            filtered_lines.append(line.strip())
+
+    cleaned = "\n".join(filtered_lines).strip()
+    logger.debug(f"Cleaned output: {cleaned}")
+    return cleaned
+
+def parse_goose_response(response: str, task: Optional[str] = None) -> dict:
+    if not response:
+        logger.warning("Received empty response to parse")
+        return {
+            "raw_response": "",
+            "parsed_actions": [],
+            "error": "Empty response received from goose command"
+        }
+        
+    logger.debug(f"Parsing response: {response}")
+    
+    shell_info = extract_shell_command(response)
+    if shell_info:
+        return {
+            "raw_response": response,
+            "parsed_actions": [{
+                "action": "shell_command",
+                "parameters": shell_info
+            }],
+            "shell_command": shell_info["command"],
+            "shell_response": shell_info["response"]
+        }
+    
+    function_pattern = r'<function=([^{]+){([^}]+)}</function>'
+    matches = re.finditer(function_pattern, response)
+    
+    parsed_actions = []
+    for match in matches:
+        function_name = match.group(1)
+        try:
+            params = json.loads(match.group(2))
+            parsed_actions.append({
+                "action": function_name,
+                "parameters": params
+            })
+            logger.debug(f"Parsed action: {function_name} with params: {params}")
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse JSON for function {function_name}: {e}")
+            parsed_actions.append({
+                "action": function_name,
+                "parameters": match.group(2)
+            })
+    
+    result = {
+        "raw_response": response,
+        "parsed_actions": parsed_actions
+    }
+    
+    if not parsed_actions:
+        logger.warning("No actions were parsed from the response")
+        result["error"] = "No actions found in response"
+        
+    logger.debug(f"Final parsed result: {json.dumps(result)}")
+    return result
 
 @app.post("/run-goose/", response_model=GooseResponse)
 def run_goose(input: GooseInput):
@@ -272,3 +275,34 @@ def run_goose(input: GooseInput):
     except Exception as e:
         logger.error(f"[{request_id}] Error processing request: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/parse-invoice/", response_model=InvoiceData)
+async def parse_invoice(file: UploadFile = File(...)):
+    """
+    Parse an invoice PDF and return structured data.
+    
+    This endpoint accepts a PDF file upload and extracts key invoice details
+    including invoice number, dates, amounts, and parties involved.
+    """
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+        
+    try:
+        contents = await file.read()
+        invoice_data = extract_invoice_data(contents)
+        
+        # Goose API integration test
+        response = await goose_client.run_goose_agent(
+            instructions="say hello",
+            session_name="test-session"
+        )
+        print(response)
+        
+        return invoice_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing invoice: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "service": "next-invoice-parser"}

@@ -1,4 +1,4 @@
-#!/Users/jonathangan/Desktop/goose-api/bin/python3.12
+#!/root/goose-api/bin/python3
 # -*- coding: utf-8 -*-
 import re
 import sys
