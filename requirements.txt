@@ -18,3 +18,4 @@ httpx>=0.24.0  # For async API testing
 
 # Utilities
 python-dateutil>=2.8.2  # For date
+python-dotenv>=1.1.0
