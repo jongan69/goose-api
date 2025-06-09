@@ -102,6 +102,11 @@ class ParseInvoiceRequest(BaseModel):
     """Request model for invoice parsing with instructions."""
     instructions: str = "Analyze this invoice and extract all relevant information."
 
+class ParseInvoiceResponse(BaseModel):
+    """Response model for invoice parsing endpoint."""
+    invoice_data: InvoiceData
+    goose_response: GooseResponse
+
 def extract_shell_command(text: str) -> dict:
     """Extract shell command and its output from the response."""
     command_pattern = r'command: (.*?)(?:\n\n|\n$)'
@@ -279,7 +284,7 @@ def run_goose(input: GooseInput):
         logger.error(f"[{request_id}] Error processing request: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/parse-invoice/", response_model=InvoiceData)
+@app.post("/parse-invoice/", response_model=ParseInvoiceResponse)
 async def parse_invoice(
     file: UploadFile = File(...),
     request: ParseInvoiceRequest = None
@@ -291,8 +296,15 @@ async def parse_invoice(
     including invoice number, dates, amounts, and parties involved.
     
     Args:
-        file: The PDF file to parse
-        request: Optional request body containing instructions for the goose agent
+        file: The PDF file to parse (required, sent as form-data with key 'file')
+        request: Optional request body containing instructions and session_name
+                (sent as form-data with key 'request' as JSON string)
+    
+    Example curl request:
+        curl -X POST \\
+          -F "file=@/path/to/invoice.pdf" \\
+          -F "request={\\"instructions\\": \\"Analyze this invoice\\", \\"session_name\\": \\"my-session\\"}" \\
+          http://localhost:8000/parse-invoice/
     """
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -301,16 +313,36 @@ async def parse_invoice(
         contents = await file.read()
         invoice_data = extract_invoice_data(contents)
         
-        # Direct goose integration test
+        # Direct goose integration
         goose_input = GooseInput(
-            instructions=request.instructions if request else "Analyze this invoice data and provide insights",
-            session_name="test-session",
-            data={"invoice_data": invoice_data.dict()}
+            instructions=f"""
+            Analyze the following invoice data and provide insights:
+            
+            Invoice Number: {invoice_data.invoice_number}
+            Issue Date: {invoice_data.issue_date}
+            Due Date: {invoice_data.due_date}
+            Total Amount: {invoice_data.total_amount} {invoice_data.currency}
+            Buyer: {invoice_data.buyer.name}
+            Confidence Score: {invoice_data.confidence_score}
+            
+            Please analyze this data and provide:
+            1. A summary of the invoice
+            2. Any potential risks or concerns
+            3. Recommendations for processing this invoice
+            """,
+            session_name=request.session_name if request else "local-goose-session",
+            data={
+                "invoice_data": invoice_data.dict(),
+                "task": "invoice_analysis"
+            }
         )
         response = run_goose(goose_input)
         print(response)
         
-        return invoice_data
+        return {
+            "invoice_data": invoice_data,
+            "goose_response": response
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing invoice: {str(e)}")
 
