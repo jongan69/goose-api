@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 from dotenv import load_dotenv
 from services.pdf_parser import extract_invoice_data
+from services.credit_scoring import get_credit_score
 from models.invoice import InvoiceData
 import subprocess
 import re
@@ -305,6 +306,11 @@ def parse_goose_response(response: str, task: Optional[str] = None) -> dict:
     logger.debug(f"Final parsed result: {json.dumps(result)}")
     return result
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "service": "next-invoice-parser"}
+
 @app.post("/run-goose/", response_model=GooseResponse)
 def run_goose(input: GooseInput):
     request_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -423,6 +429,10 @@ async def parse_invoice(
     try:
         contents = await file.read()
         invoice_data = extract_invoice_data(contents)
+        
+        # Add credit risk to invoice data
+        credit_score, lenders = get_credit_score(invoice_data.model_dump())
+        invoice_data.credit_risk = credit_score  # Use credit score as credit risk
         
         # Direct goose integration
         goose_input = GooseInput(
@@ -731,7 +741,17 @@ async def get_funding_options(
             error=str(e)
         )
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy", "service": "next-invoice-parser"}
+@app.post("/debug/credit-check")
+async def debug_credit_check(invoice_data: Dict[str, Any]):
+    """
+    Bypass invoice upload and manually trigger credit check with sample data.
+    """
+    logger.info(f"Running debug credit check with data: {invoice_data}")
+
+    # Get credit score and lenders from credit_scoring service
+    credit_score, lenders = get_credit_score(invoice_data)
+
+    return {
+        "credit_score": credit_score,
+        "lenders": lenders
+    }
